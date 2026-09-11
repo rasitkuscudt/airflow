@@ -320,20 +320,41 @@ def grid_iceberg_history():
     def report(tables: list[str]) -> None:
         """Print what Iceberg is now keeping, so the DAG shows its work.
 
-        Not a check — nothing here fails. It exists so that one task's log
-        answers "is Iceberg actually doing anything": how many snapshots are
-        retained, how the months are partitioned, how many rows each holds.
+        Not a check, and now actually not one. The first version said exactly
+        that in this docstring and then failed the whole DAG on a SQL error in
+        its own pretty-printing — the maintenance had already succeeded, the
+        data was loaded and compacted, and the run went red because the
+        summary could not be formatted. Stating a property is not enforcing
+        it, so the queries are wrapped: a table that cannot be summarised says
+        so and the others still print.
+
+        What broke: the `partition` column of an Iceberg $partitions table is
+        a ROW, one field per partition field — here `row(run_ts_month
+        integer)` — and a row cannot be cast to varchar. The field also holds
+        months since the epoch rather than anything readable, so 679 means
+        2026-08. Both are fixed by reaching into the field and turning the
+        count back into a date.
         """
         for table in sorted(tables):
-            snaps = _one(f"SELECT count(*) FROM {_meta(table, 'snapshots')}")[0]
-            parts = _hook().get_records(f"""
-                SELECT cast(partition AS varchar), record_count, file_count
-                FROM {_meta(table, 'partitions')}
-                ORDER BY 1
-            """)
+            try:
+                snaps = _one(f"SELECT count(*) FROM {_meta(table, 'snapshots')}")[0]
+                parts = _hook().get_records(f"""
+                    SELECT cast(
+                             date_add('month', partition.run_ts_month, DATE '1970-01-01')
+                             AS varchar
+                           ),
+                           record_count,
+                           file_count
+                    FROM {_meta(table, 'partitions')}
+                    ORDER BY 1
+                """)
+            except Exception as e:  # noqa: BLE001
+                print(f"{_target(table)}: could not be summarised — {e}")
+                continue
+
             print(f"\n{_target(table)}: {snaps} snapshots retained")
-            for partition, records, files in parts:
-                print(f"  {partition}  {records} rows in {files} file(s)")
+            for month, records, files in parts:
+                print(f"  {month[:7]}  {records} rows in {files} file(s)")
 
     ready = ensure()
     checked = columns_match.expand(table=ready)
