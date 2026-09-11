@@ -63,14 +63,19 @@ OUTPUTS = ["grid/grid_losses", "grid/meter_anomalies", "grid/zone_summary"]
 # the three, so listing it is the cheapest.
 CADENCE_SOURCE = "grid/zone_summary_history"
 
-# Used when the cadence cannot be derived: history disabled in the chart, or a
-# fresh install with too few runs to measure. Matches the old hard-coded value,
-# which is right for the default hourly schedule.
-FALLBACK_MAX_AGE_HOURS = 3.0
+# Used only when NO gap can be measured at all — history disabled in the chart,
+# or a brand-new install with a single run recorded. Deliberately generous
+# enough to cover one nightly cycle with slack, because the alternative is
+# assuming a cadence, and the wrong assumption here is the expensive one: a
+# monitor that is briefly too lax costs a day of blindness on a fresh install,
+# while one that cries wolf every day is muted within a week and then protects
+# nothing for good.
+FALLBACK_MAX_AGE_HOURS = 30.0
 
-# Enough writes for a median to mean something. Three gaps: one slow run cannot
-# move the middle value.
-MIN_WRITES = 4
+# Enough gaps for a median to be robust — one slow run cannot move the middle
+# value. Below this the gaps that exist are still used (see derive_threshold);
+# what changes is how they are combined, not whether they are trusted.
+ROBUST_GAPS = 3
 
 # A derived threshold is never allowed past this. The derivation is naturally
 # resistant to an ongoing outage — a job that stopped yesterday contributes no
@@ -127,25 +132,49 @@ def grid_ml_output_check():
         stamps, _ = _timestamps(client, CADENCE_SOURCE)
         runs = sorted(ts for key, ts in stamps if key.endswith(".parquet"))
 
-        if len(runs) < MIN_WRITES:
-            print(
-                f"{CADENCE_SOURCE}: {len(runs)} runs recorded, need {MIN_WRITES} "
-                f"to measure a cadence — falling back to {FALLBACK_MAX_AGE_HOURS}h. "
-                f"If history is disabled in the chart (history.enabled=false) "
-                f"this is permanent, and the fallback assumes the default "
-                f"hourly schedule."
-            )
-            return FALLBACK_MAX_AGE_HOURS
-
         gaps = [
             (b - a).total_seconds() / 3600.0
             for a, b in zip(runs, runs[1:])
         ]
-        median = statistics.median(gaps)
-        threshold = min(2.0 * median + 1.0, CEILING_HOURS)
+
+        if not gaps:
+            print(
+                f"{CADENCE_SOURCE}: {len(runs)} run(s) recorded, so there is no "
+                f"gap to measure — using {FALLBACK_MAX_AGE_HOURS:.0f}h until "
+                f"there is. If history is disabled in the chart "
+                f"(history.enabled=false) this is permanent rather than "
+                f"temporary, and the number is a guess covering a nightly "
+                f"schedule; set it deliberately or turn history on."
+            )
+            return FALLBACK_MAX_AGE_HOURS
+
+        # Median once there are enough gaps for a middle value to mean
+        # something; the largest gap while there are not. With one or two
+        # samples the pessimistic reading is the honest one — a median of two
+        # numbers is their average, which on a nightly install that has only
+        # just started would sit below a normal cycle and fire on a healthy
+        # job. Erring long here costs a little detection latency for a day or
+        # two; erring short costs the monitor's credibility permanently.
+        if len(gaps) >= ROBUST_GAPS:
+            basis, how = statistics.median(gaps), "median"
+        else:
+            basis, how = max(gaps), "largest of only %d" % len(gaps)
+
+        # Never below what the most recent gap implies, which is what makes a
+        # changed schedule safe. An install that ran hourly for a week and then
+        # moved to nightly has a median still dominated by the old cadence, so
+        # a pure median would hold the threshold at 3h and go red the very day
+        # the schedule changed — punishing a deliberate, correct action. The
+        # latest gap is the pipeline's most current statement about itself.
+        # It costs one cycle of extra tolerance after a genuinely slow run,
+        # which is the cheaper mistake.
+        if gaps[-1] > basis:
+            basis, how = gaps[-1], f"{how} {basis:.2f}h overridden by latest"
+
+        threshold = min(2.0 * basis + 1.0, CEILING_HOURS)
 
         print(
-            f"{CADENCE_SOURCE}: {len(runs)} runs, median gap {median:.2f}h "
+            f"{CADENCE_SOURCE}: {len(runs)} runs, {how} gap {basis:.2f}h "
             f"-> stale after {threshold:.1f}h"
         )
         if threshold == CEILING_HOURS:

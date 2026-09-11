@@ -1,0 +1,5 @@
+# Byte-code from local syntax checks. Nothing here should ever reach the
+# cluster: git-sync clones this repo straight into the dag-processor, so
+# anything committed under dags/ is something Airflow will try to read.
+__pycache__/
+*.py[cod]
