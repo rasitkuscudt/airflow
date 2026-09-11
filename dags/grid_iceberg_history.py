@@ -32,8 +32,9 @@ WHAT IT DOES, hourly:
         │                      (unchanged — still the Spark job's output)
         │  incremental, by run_ts watermark
         ▼
-  iceberg.grid.*_history       partitioned by month(run_ts), compacted,
+  iceberg.grid_history.*       partitioned by month(run_ts), compacted,
                                snapshots expired after 7 days
+                               (its own metastore database — see below)
 
 Each step is idempotent. The load is bounded by the watermark already in the
 Iceberg table, so a repeated or missed run duplicates nothing and needs no
@@ -60,6 +61,26 @@ from airflow.sdk import dag, task
 
 CONN = "trino"
 BUCKET = os.environ.get("AIRFLOW_VAR_S3_BUCKET", "lakehouse")
+
+# THE ICEBERG TABLES GET THEIR OWN METASTORE DATABASE, and the first version
+# of this did not, which is worth writing down because the reasoning behind
+# the mistake is so plausible.
+#
+# Two Trino catalogs over the same metastore are not two namespaces. Both the
+# hive and iceberg catalogs in this platform point at the same HMS — the same
+# `<release>-hive` ConfigMap — so `hive.grid` and `iceberg.grid` are the SAME
+# database. The catalog prefix names a connector, not a container.
+#
+# So CREATE TABLE iceberg.grid.grid_losses_history found the Hive external
+# table that section 5.1 registered, saw that it was not an Iceberg table, and
+# refused: "Table 'iceberg.grid.grid_losses_history' of unsupported type
+# already exists". Not a permissions problem, not a connector problem — the
+# name was simply taken.
+#
+# Hence a separate database. The `_history` suffix then drops off the table
+# names: every table in this schema is history, so repeating it would be
+# noise. hive.grid.zone_summary_history becomes iceberg.grid_history.zone_summary.
+ICEBERG_SCHEMA = "grid_history"
 
 # s3a:// because that is the scheme the showcase's Hive DDL uses and is
 # therefore proven on this cluster. Trino's native S3 filesystem prefers
@@ -132,6 +153,25 @@ def _cols(table: str) -> str:
     return ", ".join(name for name, _ in TABLES[table])
 
 
+def _target(table: str) -> str:
+    """Iceberg name for a Hive history table.
+
+    Keyed off the Hive name everywhere else, so the two never need to be kept
+    in step by hand: hive.grid.zone_summary_history -> the schema above,
+    without the suffix the schema already says.
+    """
+    return f"iceberg.{ICEBERG_SCHEMA}.{table.removesuffix('_history')}"
+
+
+def _meta(table: str, kind: str) -> str:
+    """One of Iceberg's metadata tables — $files, $snapshots, $partitions.
+
+    The `$` has to be inside the quotes: the schema is an identifier, the
+    table-plus-suffix is a single quoted one.
+    """
+    return f'iceberg.{ICEBERG_SCHEMA}."{table.removesuffix("_history")}${kind}"'
+
+
 @dag(
     schedule="30 * * * *",
     start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
@@ -150,19 +190,22 @@ def grid_iceberg_history():
         what the showcase had to work around, and the reason the history is
         appended rather than partitioned today.
         """
-        _run(f"CREATE SCHEMA IF NOT EXISTS iceberg.grid WITH (location = '{WAREHOUSE}')")
+        _run(
+            f"CREATE SCHEMA IF NOT EXISTS iceberg.{ICEBERG_SCHEMA} "
+            f"WITH (location = '{WAREHOUSE}')"
+        )
 
         for table, cols in TABLES.items():
             body = ",\n  ".join(f"{name} {typ}" for name, typ in cols)
             _run(f"""
-                CREATE TABLE IF NOT EXISTS iceberg.grid.{table} (
+                CREATE TABLE IF NOT EXISTS {_target(table)} (
                   {body}
                 ) WITH (
                   partitioning = ARRAY['month(run_ts)'],
                   format = 'PARQUET'
                 )
             """)
-            print(f"iceberg.grid.{table} ready")
+            print(f"{_target(table)} ready")
 
         return list(TABLES)
 
@@ -208,7 +251,7 @@ def grid_iceberg_history():
         formatting it from a Python datetime invites a precision mismatch
         between what we write and what Trino stored.
         """
-        target = f"iceberg.grid.{table}"
+        target = _target(table)
         watermark = _one(f"SELECT cast(max(run_ts) AS varchar) FROM {target}")[0]
 
         where = "" if watermark is None else f"WHERE run_ts > TIMESTAMP '{watermark}'"
@@ -247,10 +290,10 @@ def grid_iceberg_history():
         Trino's iceberg.expire-snapshots.min-retention defaults to 7 days, so
         this is the floor, not an arbitrary pick.
         """
-        target = f"iceberg.grid.{table}"
+        target = _target(table)
         files_sql = (
-            f'SELECT count(*), coalesce(sum(file_size_in_bytes), 0) '
-            f'FROM iceberg.grid."{table}$files"'
+            f"SELECT count(*), coalesce(sum(file_size_in_bytes), 0) "
+            f"FROM {_meta(table, 'files')}"
         )
 
         before_n, before_b = _one(files_sql)
@@ -282,13 +325,13 @@ def grid_iceberg_history():
         retained, how the months are partitioned, how many rows each holds.
         """
         for table in sorted(tables):
-            snaps = _one(f'SELECT count(*) FROM iceberg.grid."{table}$snapshots"')[0]
+            snaps = _one(f"SELECT count(*) FROM {_meta(table, 'snapshots')}")[0]
             parts = _hook().get_records(f"""
                 SELECT cast(partition AS varchar), record_count, file_count
-                FROM iceberg.grid."{table}$partitions"
+                FROM {_meta(table, 'partitions')}
                 ORDER BY 1
             """)
-            print(f"\n{table}: {snaps} snapshots retained")
+            print(f"\n{_target(table)}: {snaps} snapshots retained")
             for partition, records, files in parts:
                 print(f"  {partition}  {records} rows in {files} file(s)")
 
