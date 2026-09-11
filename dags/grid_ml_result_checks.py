@@ -48,33 +48,57 @@ def _one(sql: str):
 def grid_ml_result_checks():
     @task
     def physics() -> None:
-        """Transformer input cannot be less than what its meters reported.
+        """Over the window, a transformer cannot deliver less than its meters measured.
 
-        A transformer delivers energy; its meters measure part of what it
-        delivered. Metered above delivered is not a small error, it means the
-        two sides of the comparison are not the same period — a feed running
-        at the wrong rate, or a window that caught meters without their
-        transformer. This is the check that would have caught the generator
-        fault, and it is the only one here that is a law rather than a
-        heuristic.
+        A transformer delivers energy and its meters measure part of what it
+        delivered, so metered above delivered means the two sides of the
+        balance are not covering the same period — a feed at the wrong rate,
+        or meters counted without their transformer.
 
-        A hair of tolerance because the hourly windows are assembled
-        independently on each side and the last one is always partial.
+        CHECKED ON THE AGGREGATE, NOT PER HOUR, and the first version of this
+        got that wrong. Per transformer-hour the expected margin is thin: the
+        generator produces about 360 transformer readings an hour against 900
+        meter readings, which works out to roughly +6% loss — and the Poisson
+        noise on those two counts is roughly ±6% combined. The signal sits
+        inside the noise, so individual hours go negative by chance. It showed
+        up immediately: 6 mid-window rows below -5%, against 6.3 predicted
+        from 175 honest transformer-hours at 1.8 sigma. The pipeline was fine;
+        the check was measuring at the wrong resolution.
+
+        Summed over the window that noise falls by the square root of the hour
+        count, to around ±2%, and the margin becomes legible. -10% is then
+        comfortably outside anything sampling can produce.
+
+        The boundary windows are excluded because the lookback cuts mid-hour:
+        the first and last are partial on both sides, and not in the same
+        proportion. A partial hour's loss_pct is meaningless at any resolution
+        — the worst row here was -293% on an input of 10.8 kWh.
         """
         row = _one(f"""
-            SELECT count(*), min(loss_pct)
-            FROM {LOSSES}
-            WHERE loss_pct < -5
+            WITH agg AS (
+              SELECT transformer_id,
+                     sum(input_kwh)   AS inp,
+                     sum(metered_kwh) AS met
+              FROM {LOSSES}
+              WHERE window_start > (SELECT min(window_start) FROM {LOSSES})
+                AND window_start < (SELECT max(window_start) FROM {LOSSES})
+              GROUP BY 1
+            )
+            SELECT count(*), coalesce(min(100.0 * (inp - met) / inp), 0)
+            FROM agg
+            WHERE 100.0 * (inp - met) / inp < -10
         """)
         bad, worst = row[0], row[1]
-        print(f"zones with loss below -5%: {bad} (worst {worst})")
+        print(f"zones whose windowed balance is below -10%: {bad} (worst {worst:.1f}%)")
         if bad:
             raise ValueError(
-                f"{bad} transformer-hours report more metered energy than was "
-                f"delivered (worst {worst:.1f}%). That is not a modelling "
-                f"error — the two sides of the balance are not covering the "
-                f"same period. Check the transformer feed's publish rate "
-                f"against the meters'."
+                f"{bad} zones measured more energy than was delivered to them "
+                f"across the whole window (worst {worst:.1f}%). Sampling noise "
+                f"cannot reach that once the hours are summed, so the two "
+                f"sides are not covering the same period. Check the "
+                f"transformer feed's publish rate against the meters' — the "
+                f"ratio of record counts in the driver log is the fastest "
+                f"look, and should be near 2.1 meters per transformer reading."
             )
 
     @task
